@@ -1,0 +1,296 @@
+esphome:
+  name: esphome-web-6af128
+  friendly_name: SmokerFanController
+  min_version: 2025.5.0
+  name_add_mac_suffix: false
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+  level: VERBOSE
+
+api:
+
+# disable the webserver if not needed
+web_server:
+  local: True
+  port: 80
+
+
+# Allow Over-The-Air updates
+ota:
+- platform: esphome
+
+wifi:
+  ssid: <wifiname>
+  password: "<wifipassword>"
+
+globals:
+  - id: climate_active
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+# Lid detection doesn't work that well yet...
+  - id: lid_open
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: last_temp
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: pid_kp
+    type: float
+    restore_value: true
+    initial_value: '0.01'
+
+  - id: pid_ki
+    type: float
+    restore_value: true
+    initial_value: '0.01'
+
+  - id: pid_kd
+    type: float
+    restore_value: true
+    initial_value: '0.01'
+
+# maximum PWM value where fan speed is still the minimum
+  - id: fan_min_pwm
+    type: float
+    restore_value: true
+    initial_value: '0.00'
+
+# minimum PWM value where the fan speed is still the max
+  - id: fan_max_pwm
+    type: float
+    restore_value: true
+    initial_value: '1.0'
+
+spi:
+  clk_pin: GPIO19
+  miso_pin: GPIO18
+
+switch:
+  - platform: gpio
+    pin: GPIO26
+    name: "Fan Relay"
+    id: fan_relay
+
+sensor:
+  - platform: pid
+    name: "PID Output"
+    type: RESULT
+    climate_id: pid_fan_controller
+
+  - platform: pulse_counter
+    pin:
+      number: GPIO13
+    name: PWM Fan RPM
+    id: fan_pulse
+    unit_of_measurement: 'RPM'
+    filters:
+      multiply: 0.5
+    update_interval: 1s
+
+  - platform: max6675
+    id: smoker_temp
+    name: "Smoker Temperature"
+    cs_pin: GPIO5
+    update_interval: 5s
+
+
+climate:
+  - platform: pid
+    id: pid_fan_controller
+    name: "PID Climate Controller"
+    sensor: smoker_temp
+    default_target_temperature: 200°F
+    visual:
+      min_temperature: 50°F
+      max_temperature: 500°F
+      temperature_step: 5°F
+    heat_output: fanhub_pwm
+    control_parameters:
+      kp: 0.01
+      ki: 0.01
+      kd: 0.01
+      output_averaging_samples: 3      
+      derivative_averaging_samples: 20 
+      min_integral: 0
+      max_integral: 1
+    deadband_parameters:
+      threshold_high: 5.0°F       
+      threshold_low: -5.0°F
+      kp_multiplier: 1.0   # proportional gain remain the same inside the deadband but i and d massively reduced to prevent excessive oscillations
+      ki_multiplier: 0.05  
+      kd_multiplier: 0.05  
+    
+    on_control:
+      then:
+        # when changing temperatures or modes - reset the integral term to remove state
+        - lambda: |- 
+            id(pid_fan_controller).reset_integral_term();
+            
+    on_state:
+      then:
+        - lambda: |-
+            id(climate_active) = (id(pid_fan_controller).mode != CLIMATE_MODE_OFF);
+            if(id(pid_fan_controller).mode == CLIMATE_MODE_OFF)
+            {
+              return;
+            }
+
+            float error = id(pid_fan_controller).get_error_value();
+
+            // Use 3 phases of gain scheduling to prevent overshoot
+            if (error > 70) {
+              id(pid_fan_controller).set_kp(id(pid_kp) / 3.0);  
+              id(pid_fan_controller).set_kd(id(pid_kd) * 5);  
+              id(pid_fan_controller).set_ki(0.0);  
+              id(pid_fan_controller).reset_integral_term();
+            }
+            else if (error > 30) {
+              id(pid_fan_controller).set_kp(id(pid_kp) / 2.0);  
+              id(pid_fan_controller).set_kd(id(pid_kd) * 2);  
+              id(pid_fan_controller).set_ki(0.0);  
+              id(pid_fan_controller).reset_integral_term();
+            } else {
+              id(pid_fan_controller).set_kp(id(pid_kp));
+              id(pid_fan_controller).set_ki(id(pid_ki));
+              id(pid_fan_controller).set_kd(id(pid_kd));
+            }
+
+            if (id(lid_open)) {
+              // when the lid is open the temperature will sharply drop but the oxygen-rich air will cause the temperature to rapidly rise once the lid is closed
+              id(pid_fan_controller).reset_integral_term(); 
+              id(fan_speed).publish_state(0.0);
+              return;
+            }
+
+
+button:
+  - platform: restart
+    name: "Restart"
+
+number:
+  - platform: template
+    name: "PID Kp"
+    id: kp_input
+    min_value: 0.0
+    max_value: 1.0
+    step: 0.000001
+    mode: BOX
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: |-
+            id(pid_kp) = x;
+            id(pid_fan_controller).set_kp(x);
+
+
+  - platform: template
+    name: "PID Ki"
+    id: ki_input
+    min_value: 0.0
+    max_value: 1.0
+    step: 0.0000001
+    mode: BOX
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: |-
+            id(pid_ki) = x;
+            id(pid_fan_controller).set_ki(x);
+
+  - platform: template
+    name: "PID Kd"
+    id: kd_input
+    min_value: 0.0
+    max_value: 1.0
+    step: 0.000001
+    mode: BOX
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: |-
+            id(pid_kd) = x;
+            id(pid_fan_controller).set_kd(x);
+
+
+# Used to manually override the fan speed
+  - platform: template
+    name: "Fan Speed"
+    id: fan_speed
+    min_value: 0.0
+    max_value: 1.0
+    step: 0.01
+    mode: slider
+    update_interval: never
+    optimistic: true
+    on_value:
+      then:
+        # set to level of val * 0.6 because the fan used for this maxed out after 60% PWM
+        - lambda: |-
+            float val = x;
+            id(actual_pwm).set_level(id(fan_min_pwm) + val * (id(fan_max_pwm) - id(fan_min_pwm)));
+            if (val > 0.01) {
+              id(fan_relay).turn_on();
+            } else {
+              id(fan_relay).turn_off();
+            }
+
+
+output:
+  - platform: ledc
+    id: actual_pwm
+    pin: GPIO12
+    frequency: 10000 Hz
+
+  - platform: template
+    id: fanhub_pwm
+    type: float
+    write_action:
+      then:
+        - lambda: |-
+            if (id(climate_active))
+            {
+              id(fan_speed).publish_state(state);
+            }
+
+script:
+  - id: reset_lid_open
+    then:
+      - delay: 90s
+      - lambda: |-
+          id(lid_open) = false;
+          ESP_LOGI("lid_detect", "Lid closed, resuming PID control.");
+
+
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          float error = id(pid_fan_controller).get_error_value();
+          ESP_LOGD("pid_debug", "Temp: %.2f | Setpoint: %.2f | Error: %.2f | Mode: %d",
+                   id(smoker_temp).state, id(pid_fan_controller).target_temperature, error, id(pid_fan_controller).mode);
+          float current_temp = id(smoker_temp).state;
+          float delta = current_temp - id(last_temp);
+          id(last_temp) = current_temp;
+
+          if (!id(lid_open) && id(smoker_temp).state > 100.0 && delta < -5.0) {
+            id(lid_open) = true;
+            ESP_LOGI("lid_detect", "Lid likely opened (ΔT = %.2f°F), pausing fan.", delta);
+            id(fan_speed).publish_state(0.0);
+            id(reset_lid_open).execute();
+          }
+
